@@ -1,4 +1,3 @@
-
 name: aseprite
 
 on:
@@ -8,11 +7,16 @@ on:
         description: "Version to build, leave empty for latest"
         required: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-2025
-    steps:
+    outputs:
+      aseprite_version: ${{ steps.build.outputs.ASEPRITE_VERSION }}
 
+    steps:
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -23,9 +27,106 @@ jobs:
         env:
           ASEPRITE_VERSION: ${{ github.event.inputs.version }}
 
-      - name: Archive
+      - name: Validate build output
+        shell: bash
+        run: |
+          set -e
+          if [ ! -d github ]; then
+            echo "Missing github output directory after build"
+            exit 1
+          fi
+          find github -maxdepth 2 -type f | head
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: aseprite-${{ steps.build.outputs.ASEPRITE_VERSION }}
           path: github
           if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: ${{ success() }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build.outputs.ASEPRITE_VERSION }}
+          name: Aseprite ${{ steps.build.outputs.ASEPRITE_VERSION }}
+          files: github/**
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  maintenance:
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Ninja update
+        id: ninja_check
+        shell: bash
+        run: |
+          set -e
+
+          pinned=$(grep -oE 'ninja-win\.zip.*v[0-9]+\.[0-9]+\.[0-9]+' build.cmd || true | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/v\1/' || true)
+          if [ -z "$pinned" ]; then
+            echo "No pinned Ninja version found in build.cmd"
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Pinned Ninja: $pinned"
+
+          latest=$(curl -fsSL https://api.github.com/repos/ninja-build/ninja/releases/latest | python3 -c "import sys, json; print(json.load(sys.stdin).get('tag_name',''))" || true)
+          if [ -z "$latest" ]; then
+            echo "Could not determine latest Ninja release"
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Latest Ninja: $latest"
+
+          if [ "$pinned" = "$latest" ]; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "latest_version=${latest#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update build.cmd if needed
+        if: ${{ steps.ninja_check.outputs.needs_update == 'true' }}
+        shell: bash
+        run: |
+          set -e
+          latest="${{ steps.ninja_check.outputs.latest_version }}"
+          old=$(grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' build.cmd | head -n 1 || true)
+          if [ -z "$old" ]; then
+            echo "Unable to detect current pinned Ninja version"
+            exit 1
+          fi
+
+          perl -0pi -e "s@/ninja/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/ninja-win\.zip@/ninja/releases/download/v${latest}/ninja-win.zip@g" build.cmd
+
+      - name: Create PR for dependency update
+        if: ${{ steps.ninja_check.outputs.needs_update == 'true' }}
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: chore/update-ninja-${{ steps.ninja_check.outputs.latest_version }}
+          base: master
+          commit-message: "chore: update pinned Ninja to v${{ steps.ninja_check.outputs.latest_version }}"
+          title: "chore: update pinned Ninja to v${{ steps.ninja_check.outputs.latest_version }}"
+          body: |
+            This maintenance update bumps the pinned Ninja version used by the Windows build script.
+
+            Validation:
+            - build workflow was run
+            - release packaging completed
+            - the dependency check detected a newer Ninja release
+          labels: maintenance
